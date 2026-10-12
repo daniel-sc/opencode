@@ -1,5 +1,14 @@
 import { expect, test } from "bun:test"
-import { GenerationOptions, LLMClient, LLMEvent, LanguageModel, ToolDefinition, type LLMRequest } from "@opencode/ai"
+import {
+  AIError,
+  InvalidRequestError,
+  GenerationOptions,
+  LLMClient,
+  LLMEvent,
+  LanguageModel,
+  ToolDefinition,
+  type LLMRequest,
+} from "@opencode/ai"
 import { OpenAIChat } from "@opencode/ai/protocols"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -33,6 +42,7 @@ import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
 let requests: LLMRequest[] = []
+let rejection: "context-overflow" | "payload-too-large" | undefined
 const model = LanguageModel.make({
   id: "summary-model",
   provider: "test",
@@ -51,6 +61,11 @@ const cost = [
 const client = Layer.mock(LLMClient.Service)({
   stream: (request: LLMRequest) => {
     requests.push(request)
+    if (rejection) {
+      const classification = rejection
+      rejection = undefined
+      return Stream.fail(new AIError({ reason: new InvalidRequestError({ message: "Too large", classification }) }))
+    }
     return Stream.make(
       LLMEvent.textDelta({ id: "summary", text: "## Objective\n- manual summary" }),
       LLMEvent.stepFinish({
@@ -604,3 +619,108 @@ it.effect("forked session compaction reuses the fork root prompt cache key", () 
     expect(requests[0]?.promptCacheKey).toBe(rootID)
   }),
 )
+
+for (const scenario of [
+  { name: "without shrinking", recent: 1, older: 1, window: 200_000, retained: true, keptOlder: true },
+  {
+    name: "after payload rejection",
+    recent: 1,
+    older: 1,
+    window: 200_000,
+    retained: true,
+    keptOlder: true,
+    rejection: "payload-too-large",
+  },
+  {
+    name: "dropping recent before newer exchanges",
+    recent: 30_000,
+    older: 1,
+    window: 10_000,
+    retained: false,
+    keptOlder: true,
+  },
+  {
+    name: "dropping recent and the oldest new exchange",
+    recent: 1,
+    older: 30_000,
+    window: 10_000,
+    retained: false,
+    keptOlder: false,
+  },
+  {
+    name: "after context overflow",
+    recent: 12_000,
+    older: 1,
+    window: 200_000,
+    retained: false,
+    keptOlder: true,
+    rejection: "context-overflow",
+  },
+] as const) {
+  it.effect(`compaction preserves checkpoint hook edits ${scenario.name}`, () =>
+    Effect.gen(function* () {
+      requests = []
+      rejection = "rejection" in scenario ? scenario.rejection : undefined
+      const canary = `COMPACTION-TEST-CANARY-${crypto.randomUUID()}`
+      const session = yield* insertSession(Session.ID.create())
+      const hooks = yield* PluginHooks.Service
+      const compaction = yield* SessionCompaction.Service
+      yield* compaction.transform((editor) => editor.configure({ keep: 0 }))
+      const checkpoint = Schema.decodeUnknownSync(SessionMessage.CompactionCompleted)({
+        id: SessionMessage.ID.create(),
+        type: "compaction",
+        status: "completed",
+        reason: "auto",
+        summary: `SUMMARY ${canary}`,
+        recent: `RECENT ${canary} ${"old ".repeat(scenario.recent)}`,
+        time: { created: 0, completed: 0 },
+      })
+      const messages = [
+        checkpoint,
+        SessionMessage.User.make({
+          id: SessionMessage.ID.create(),
+          type: "user",
+          text: `OLDER-EXCHANGE ${"old ".repeat(scenario.older)}`,
+          time: { created: DateTime.makeUnsafe(1) },
+        }),
+        SessionMessage.User.make({
+          id: SessionMessage.ID.create(),
+          type: "user",
+          text: "NEWER-EXCHANGE",
+          time: { created: DateTime.makeUnsafe(2) },
+        }),
+        SessionMessage.User.make({
+          id: SessionMessage.ID.create(),
+          type: "user",
+          text: "Tail retained outside the summary request",
+          time: { created: DateTime.makeUnsafe(3) },
+        }),
+      ]
+      let calls = 0
+      yield* hooks.register("session", "compaction", (event) =>
+        Effect.sync(() => {
+          expect(JSON.stringify(event.messages).includes(canary)).toBe(true)
+          event.messages = JSON.parse(JSON.stringify(event.messages).replaceAll(canary, "[redacted]"))
+          calls++
+        }),
+      )
+      const context = loaded(session, messages)
+      const outcome = yield* compaction.compact({
+        reason: "manual",
+        inputID: SessionMessage.ID.create(),
+        context: { ...context, model: { ...context.model, limit: { context: scenario.window, output: 2000 } } },
+      })
+      expect(outcome.status).toBe("completed")
+      expect(calls).toBe(1)
+      expect(requests).toHaveLength("rejection" in scenario ? 2 : 1)
+      expect(JSON.stringify(requests).includes(canary)).toBe(false)
+      const sent = JSON.stringify(requests.at(-1)?.messages)
+      expect(sent.includes("SUMMARY [redacted]")).toBe(true)
+      expect(sent.includes("RECENT [redacted]")).toBe(scenario.retained)
+      expect(sent.includes("OLDER-EXCHANGE")).toBe(scenario.keptOlder)
+      expect(sent.includes("NEWER-EXCHANGE")).toBe(true)
+      expect(checkpoint.summary.includes(canary)).toBe(true)
+      expect(checkpoint.recent.includes(canary)).toBe(true)
+    }),
+  )
+}

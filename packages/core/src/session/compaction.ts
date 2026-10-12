@@ -470,24 +470,17 @@ export const layer = Layer.effect(
             (previous !== undefined && message.id === previous.id) ||
             message.content.some((part) => part.type === "compaction"),
         ) + 1
-      const summary = previous !== undefined && !SessionProviderContext.isCheckpoint(previous) ? previous : undefined
-      // TODO: Read the previous summary from the hooked request once it no longer merges summary and recent into one
-      // message. Until then it is rebuilt from storage, which drops a compaction hook's edits to that message.
-      const lead = summary
-        ? toLLMMessages([{ ...summary, recent: "" }], context.model.ref)
-        : request.messages.slice(0, end)
+      // Shrink the hook-edited messages, never reconstruct their text from stored history.
+      const lead = request.messages.slice(0, end)
 
       // A user message and everything after it, up to the next one, is one exchange: kept or dropped whole.
-      const exchanges = request.messages.slice(end).reduce<string[]>(
-        (groups, message) => {
-          const text = flattenMessage(message)
-          if (!text) return groups
-          if (message.role === "user" || groups.length === 0) groups.push(text)
-          else groups[groups.length - 1] += `\n${text}`
-          return groups
-        },
-        summary?.recent ? [summary.recent] : [],
-      )
+      const exchanges = request.messages.slice(end).reduce<string[]>((groups, message) => {
+        const text = flattenMessage(message)
+        if (!text) return groups
+        if (message.role === "user" || groups.length === 0) groups.push(text)
+        else groups[groups.length - 1] += `\n${text}`
+        return groups
+      }, [])
 
       const note = (omitted: number) =>
         omitted ? `[${omitted} older ${omitted === 1 ? "exchange" : "exchanges"} omitted]\n\n` : ""
@@ -579,6 +572,19 @@ export const layer = Layer.effect(
       webSocket?: "session",
     ) => {
       const base = transcript(context, messages)
+      const previous = previousCompaction(messages)
+      // Keep recent text separately droppable before hooks edit it. The summary keeps
+      // the checkpoint ID used by shrinking to locate the protected prefix.
+      if (previous?.recent && !SessionProviderContext.isCheckpoint(previous)) {
+        base.messages = base.messages.flatMap((message) =>
+          message.id === previous.id
+            ? [
+                ...toLLMMessages([{ ...previous, recent: "" }], context.model.ref, base.providerMetadataKey),
+                Message.user(`<recent-context>\n${previous.recent}\n</recent-context>`),
+              ]
+            : [message],
+        )
+      }
       return requests.compaction({
         session: context.session,
         agent: context.agent.id,

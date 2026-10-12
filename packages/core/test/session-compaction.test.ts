@@ -604,3 +604,66 @@ it.effect("forked session compaction reuses the fork root prompt cache key", () 
     expect(requests[0]?.promptCacheKey).toBe(rootID)
   }),
 )
+
+it.effect("compaction shrinking preserves hook redaction of stored checkpoints", () =>
+  Effect.gen(function* () {
+    requests = []
+    const canary = `COMPACTION-TEST-CANARY-${crypto.randomUUID()}`
+    const session = yield* insertSession(Session.ID.make("ses_redaction_shrink"))
+    const hooks = yield* PluginHooks.Service
+    const compaction = yield* SessionCompaction.Service
+    yield* compaction.transform((editor) => editor.configure({ keep: 0 }))
+    const checkpoint = Schema.decodeUnknownSync(SessionMessage.CompactionCompleted)({
+      id: SessionMessage.ID.create(),
+      type: "compaction",
+      status: "completed",
+      reason: "auto",
+      summary: `Summary ${canary}`,
+      recent: `Recent ${canary}`,
+      time: { created: 0, completed: 0 },
+    })
+    const messages = [
+      checkpoint,
+      {
+        id: SessionMessage.ID.create(),
+        type: "user" as const,
+        text: "old ".repeat(30000),
+        time: { created: DateTime.makeUnsafe(1) },
+      },
+      {
+        id: SessionMessage.ID.create(),
+        type: "user" as const,
+        text: "Keep this exchange in the summary",
+        time: { created: DateTime.makeUnsafe(2) },
+      },
+      {
+        id: SessionMessage.ID.create(),
+        type: "user" as const,
+        text: "Newest exchange",
+        time: { created: DateTime.makeUnsafe(2) },
+      },
+    ]
+    let hooked = false
+    yield* hooks.register("session", "compaction", (event) =>
+      Effect.sync(() => {
+        expect(JSON.stringify(event.messages).includes(canary)).toBe(true)
+        event.messages = JSON.parse(JSON.stringify(event.messages).replaceAll(canary, "<SECRET:CANARY>"))
+        expect(JSON.stringify(event.messages).includes(canary)).toBe(false)
+        hooked = true
+      }),
+    )
+    const context = loaded(session, messages)
+    const outcome = yield* compaction.compact({
+      reason: "manual",
+      inputID: SessionMessage.ID.create(),
+      context: { ...context, model: { ...context.model, limit: { context: 10000, output: 2000 } } },
+    })
+    expect(hooked).toBe(true)
+    expect(outcome.status).toBe("completed")
+    expect(requests.length).toBeGreaterThan(0)
+    expect(JSON.stringify(requests).includes(canary)).toBe(false)
+    expect(JSON.stringify(requests).includes("<SECRET:CANARY>")).toBe(true)
+    expect(checkpoint.summary.includes(canary)).toBe(true)
+    expect(checkpoint.recent.includes(canary)).toBe(true)
+  }),
+)

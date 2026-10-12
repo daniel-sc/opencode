@@ -456,8 +456,8 @@ export const layer = Layer.effect(
 
     /**
      * History that has to change is sent as text rather than as edited messages: `[previous compaction][transcript]`,
-     * the conversation since that compaction as one text message. A previous summary always stays in front, while
-     * its verbatim recent part becomes the oldest transcript entry; a previous native window stays exactly as the
+     * the conversation since that compaction as one text message. A previous checkpoint stays in front as transformed
+     * by request hooks, including its recent part; a previous native window stays exactly as the
      * provider made it. The transcript leaves out reasoning, media, and instruction updates, and cuts long tool
      * outputs. Only if it still does not fit are whole exchanges dropped, oldest first. Undefined when even the
      * newest exchange does not fit.
@@ -470,24 +470,18 @@ export const layer = Layer.effect(
             (previous !== undefined && message.id === previous.id) ||
             message.content.some((part) => part.type === "compaction"),
         ) + 1
-      const summary = previous !== undefined && !SessionProviderContext.isCheckpoint(previous) ? previous : undefined
-      // TODO: Read the previous summary from the hooked request once it no longer merges summary and recent into one
-      // message. Until then it is rebuilt from storage, which drops a compaction hook's edits to that message.
-      const lead = summary
-        ? toLLMMessages([{ ...summary, recent: "" }], context.model.ref)
-        : request.messages.slice(0, end)
+      // Preserve the checkpoint exactly as request hooks left it. Rebuilding it
+      // from stored history can restore content removed by a hook.
+      const lead = request.messages.slice(0, end)
 
       // A user message and everything after it, up to the next one, is one exchange: kept or dropped whole.
-      const exchanges = request.messages.slice(end).reduce<string[]>(
-        (groups, message) => {
-          const text = flattenMessage(message)
-          if (!text) return groups
-          if (message.role === "user" || groups.length === 0) groups.push(text)
-          else groups[groups.length - 1] += `\n${text}`
-          return groups
-        },
-        summary?.recent ? [summary.recent] : [],
-      )
+      const exchanges = request.messages.slice(end).reduce<string[]>((groups, message) => {
+        const text = flattenMessage(message)
+        if (!text) return groups
+        if (message.role === "user" || groups.length === 0) groups.push(text)
+        else groups[groups.length - 1] += `\n${text}`
+        return groups
+      }, [])
 
       const note = (omitted: number) =>
         omitted ? `[${omitted} older ${omitted === 1 ? "exchange" : "exchanges"} omitted]\n\n` : ""
